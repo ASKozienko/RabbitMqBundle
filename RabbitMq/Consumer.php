@@ -3,7 +3,11 @@
 namespace OldSound\RabbitMqBundle\RabbitMq;
 
 use OldSound\RabbitMqBundle\RabbitMq\BaseConsumer;
+use OldSound\RabbitMqBundle\RabbitMq\Event\ErrorEvent;
+use OldSound\RabbitMqBundle\RabbitMq\Event\Event;
+use OldSound\RabbitMqBundle\RabbitMq\Event\Events;
 use PhpAmqpLib\Message\AMQPMessage;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 
 class Consumer extends BaseConsumer
 {
@@ -11,6 +15,11 @@ class Consumer extends BaseConsumer
      * @var int $memoryLimit
      */
     protected $memoryLimit = null;
+
+    /**
+     * @var EventDispatcherInterface
+     */
+    protected $eventDispatcher;
 
     /**
      * Set the memory limit
@@ -57,11 +66,28 @@ class Consumer extends BaseConsumer
         $this->getChannel()->queue_purge($this->queueOptions['name'], true);
     }
 
-    public function processMessage(AMQPMessage $msg)
+    public function processMessage(AMQPMessage $message)
     {
-        $processFlag = call_user_func($this->callback, $msg);
+        try {
+            $this->eventDispatcher->dispatch(Events::MESSAGE, $event = new Event($message));
 
-        $this->handleProcessMessage($msg, $processFlag);
+            call_user_func($this->callback, $message);
+            $this->ackMessage($message);
+
+            $this->eventDispatcher->dispatch(Events::MESSAGE_SUCCESS, $event);
+        } catch (\Exception $e) {
+            $this->eventDispatcher->dispatch(Events::MESSAGE_ERROR, $event = new ErrorEvent($message, $e));
+
+            if ($event->isRequeue()) {
+                $this->requeueMessage($message);
+                $this->eventDispatcher->dispatch(Events::MESSAGE_REQUEUE, $event);
+            } else {
+                $this->dropMessage($message);
+                $this->eventDispatcher->dispatch(Events::MESSAGE_DROP, $event);
+            }
+        }
+
+        $this->eventDispatcher->dispatch(Events::MESSAGE_PROCESSED, new Event($message));
     }
 
     protected function handleProcessMessage(AMQPMessage $msg, $processFlag)
@@ -100,5 +126,29 @@ class Consumer extends BaseConsumer
         } else {
             return false;
         }
+    }
+
+    /**
+     * @param AMQPMessage $message
+     */
+    protected function ackMessage(AMQPMessage $message)
+    {
+        $message->delivery_info['channel']->basic_ack($message->delivery_info['delivery_tag']);
+    }
+
+    /**
+     * @param AMQPMessage $message
+     */
+    protected function requeueMessage(AMQPMessage $message)
+    {
+        $message->delivery_info['channel']->basic_reject($message->delivery_info['delivery_tag'], true);
+    }
+
+    /**
+     * @param AMQPMessage $message
+     */
+    protected function dropMessage(AMQPMessage $message)
+    {
+        $message->delivery_info['channel']->basic_reject($message->delivery_info['delivery_tag'], false);
     }
 }
